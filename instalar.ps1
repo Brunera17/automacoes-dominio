@@ -5,6 +5,9 @@
 # Salvo em UTF-8 com BOM: o PowerShell 5.1 lê .ps1 sem BOM como ANSI e estraga os acentos.
 param([switch]$Detectar)
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+# qualquer erro não tratado vira mensagem na tela (o PowerShell roda escondido)
+trap { if (-not $Detectar) { [Windows.Forms.MessageBox]::Show("Falha no instalador:`n`n$($_.Exception.Message)", 'Instalar Ouvinte Domínio', 'OK', 'Error') | Out-Null; exit 2 }; throw }  # 2 = erro já mostrado (o .exe não repete)
 $dir = $PSScriptRoot                 # ...\<hub>\.Ouvinte
 $hub = Split-Path $dir -Parent
 $exe = Join-Path $dir 'AutomacoesDominio.exe'
@@ -20,16 +23,31 @@ function Para-UNC($caminho) {
     return $caminho.TrimEnd('\')
 }
 
-function Encontrar-Empresas {
-    # Procura a mesma pasta do config (ex.: "DP FISCAL\SIMPLES NACIONAL") na raiz de cada unidade.
-    $sufixo = $cfg.raiz_empresas -replace '^\\\\[^\\]+\\[^\\]+\\', ''
-    $achados = @()
-    if (Test-Path $cfg.raiz_empresas) { $achados += $cfg.raiz_empresas }
-    foreach ($d in Get-PSDrive -PSProvider FileSystem) {
-        $c = Join-Path $d.Root $sufixo
-        if (Test-Path $c) { $achados += (Para-UNC $c) }
+# Test-Path numa unidade de rede desconectada pode esperar 20-60 s; feito na thread da janela,
+# congela tudo ("Não respondendo"). Por isso cada teste roda em outro processo, com tempo limite.
+function Aguardar-Jobs($jobs, $segundos) {
+    $fim = (Get-Date).AddSeconds($segundos)
+    while (@($jobs | Where-Object State -eq 'Running').Count -and (Get-Date) -lt $fim) {
+        [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100
     }
-    return @($achados | Select-Object -Unique)
+    $saida = foreach ($j in $jobs) { if ($j.State -eq 'Completed') { Receive-Job $j -ErrorAction SilentlyContinue } }
+    $jobs | Remove-Job -Force   # o que estourou o tempo é encerrado
+    return $saida
+}
+function Pasta-Existe($caminho, $segundos = 8) {
+    if (-not $caminho) { return $false }
+    $r = Aguardar-Jobs @(Start-Job { param($p) Test-Path -LiteralPath $p } -ArgumentList $caminho) $segundos
+    return ($r -contains $true)
+}
+
+function Encontrar-Empresas($segundos = 15) {
+    # Procura a mesma pasta do config (ex.: "DP FISCAL\SIMPLES NACIONAL") na raiz de cada unidade, todas em paralelo.
+    $sufixo = $cfg.raiz_empresas -replace '^\\\\[^\\]+\\[^\\]+\\', ''
+    $candidatos = @($cfg.raiz_empresas) + @(Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root $sufixo })
+    $jobs = foreach ($c in $candidatos) { Start-Job { param($p) if (Test-Path -LiteralPath $p) { $p } } -ArgumentList $c }
+    $achados = Aguardar-Jobs @($jobs) $segundos | ForEach-Object { Para-UNC $_ }
+    # mantém a ordem: o caminho atual do config primeiro
+    return @($candidatos | ForEach-Object { Para-UNC $_ } | Where-Object { $achados -contains $_ } | Select-Object -Unique)
 }
 
 function Relatorios-De($empresas) {
@@ -53,7 +71,7 @@ function Instalar($empresas, $relatorios, $simulacao) {
     $quem = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
     Stop-ScheduledTask -TaskName 'Ouvinte Dominio' -ErrorAction SilentlyContinue
     # o .exe onefile roda como pai + filho; parar a tarefa só mata o pai, então encerra pelo caminho
-    Get-Process AutomacoesDominio -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
+    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Register-ScheduledTask -TaskName 'Ouvinte Dominio' -Action $acao -Trigger $gatilho -Settings $opcoes -Principal $quem -Force | Out-Null
 
     # Tarefa 2: resumo recibo x DAS, todo dia 13 às 08:00 (Register-ScheduledTask não faz gatilho mensal)
@@ -72,7 +90,6 @@ if ($Detectar) {
 }
 
 # ---------------------------------------------------------------- janela
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 
 $form = New-Object Windows.Forms.Form -Property @{
@@ -101,20 +118,35 @@ $btCancelar = Novo Button @{ Text = 'Cancelar'; Location = '505,315'; Size = '10
 $form.AcceptButton = $btInstalar; $form.CancelButton = $btCancelar; $form.ActiveControl = $cbEmpresas
 
 function Mostrar-Status($label, $caminho) {
-    if ($caminho -and (Test-Path $caminho)) { $label.Text = '✔ Pasta encontrada'; $label.ForeColor = 'Green' }
-    else { $label.Text = '✖ Pasta não encontrada (o ouvinte tenta de novo sozinho, mas confira o caminho)'; $label.ForeColor = 'Firebrick' }
+    $label.Text = '… verificando'; $label.ForeColor = 'DimGray'
+    if (Pasta-Existe $caminho) { $label.Text = '✔ Pasta encontrada'; $label.ForeColor = 'Green' }
+    else { $label.Text = '✖ Pasta não encontrada ou sem resposta (o ouvinte tenta de novo sozinho, mas confira o caminho)'; $label.ForeColor = 'Firebrick' }
 }
 function Escolher-Pasta($inicial) {
     $d = New-Object Windows.Forms.FolderBrowserDialog -Property @{ Description = 'Escolha a pasta'; SelectedPath = $inicial }
     if ($d.ShowDialog($form) -eq 'OK') { return (Para-UNC $d.SelectedPath) }
 }
 
+# verifica só quando a pessoa para de digitar (e não a cada tecla)
+$verificando = $false
+$timer = New-Object Windows.Forms.Timer -Property @{ Interval = 700 }
+$timer.Add_Tick({
+    $timer.Stop()
+    if ($script:verificando) { $timer.Start(); return }   # DoEvents pode reentrar aqui
+    $script:verificando = $true
+    try {
+        Mostrar-Status $stEmpresas (Para-UNC $cbEmpresas.Text)
+        Mostrar-Status $stRelatorios (Para-UNC $txRelatorios.Text)
+    } finally { $script:verificando = $false }
+})
+function Agendar-Verificacao { $stEmpresas.Text = ''; $stRelatorios.Text = ''; $timer.Stop(); $timer.Start() }
+
 $relatoriosEditado = $false
 $cbEmpresas.Add_TextChanged({
-    Mostrar-Status $stEmpresas (Para-UNC $cbEmpresas.Text)
     if (-not $script:relatoriosEditado) { $txRelatorios.Text = Relatorios-De (Para-UNC $cbEmpresas.Text) }
+    Agendar-Verificacao
 })
-$txRelatorios.Add_TextChanged({ Mostrar-Status $stRelatorios (Para-UNC $txRelatorios.Text) })
+$txRelatorios.Add_TextChanged({ Agendar-Verificacao })
 $txRelatorios.Add_KeyPress({ $script:relatoriosEditado = $true })
 $btEmpresas.Add_Click({ $p = Escolher-Pasta $cbEmpresas.Text; if ($p) { $cbEmpresas.Text = $p } })
 $btRelatorios.Add_Click({ $p = Escolher-Pasta $txRelatorios.Text; if ($p) { $script:relatoriosEditado = $true; $txRelatorios.Text = $p } })
@@ -123,7 +155,10 @@ $btInstalar.Add_Click({
     $empresas = Para-UNC $cbEmpresas.Text.Trim()
     $relatorios = Para-UNC $txRelatorios.Text.Trim()
     if (-not $empresas -or -not $relatorios) { [Windows.Forms.MessageBox]::Show($form, 'Informe as duas pastas.', 'Instalar', 'OK', 'Warning') | Out-Null; return }
-    if (-not (Test-Path $empresas) -and [Windows.Forms.MessageBox]::Show($form, "A pasta das empresas não abre agora:`n$empresas`n`nInstalar assim mesmo?", 'Instalar', 'YesNo', 'Question') -ne 'Yes') { return }
+    $form.UseWaitCursor = $true; $btInstalar.Enabled = $false; $stGeral.Text = 'Verificando a pasta do servidor...'
+    $existe = Pasta-Existe $empresas 10
+    $form.UseWaitCursor = $false; $btInstalar.Enabled = $true; $stGeral.Text = ''
+    if (-not $existe -and [Windows.Forms.MessageBox]::Show($form, "A pasta das empresas não abre agora:`n$empresas`n`nInstalar assim mesmo?", 'Instalar', 'YesNo', 'Question') -ne 'Yes') { return }
     $form.UseWaitCursor = $true; $btInstalar.Enabled = $false; $stGeral.Text = 'Instalando...'; $form.Refresh()
     try {
         Instalar $empresas $relatorios $ckSimulacao.Checked
@@ -137,8 +172,12 @@ $btInstalar.Add_Click({
 })
 
 $form.Add_Shown({
-    $stGeral.Text = 'Procurando a pasta do servidor nas unidades...'; $form.Refresh()
+    # a janela nasce de um processo escondido e pode abrir atrás das outras
+    $form.TopMost = $true; $form.Activate(); $form.TopMost = $false
+    $btInstalar.Enabled = $false
+    $stGeral.Text = 'Procurando a pasta do servidor nas unidades (até 15 s)...'
     $achados = Encontrar-Empresas
+    $btInstalar.Enabled = $true
     $achados | ForEach-Object { [void]$cbEmpresas.Items.Add($_) }
     $cbEmpresas.Text = if ($achados) { $achados[0] } else { $cfg.raiz_empresas }
     $stGeral.Text = if ($achados.Count -gt 1) { "$($achados.Count) pastas encontradas: escolha na lista." } elseif ($achados) { '' } else { 'Pasta do servidor não encontrada automaticamente: use "Procurar...".' }

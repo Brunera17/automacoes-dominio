@@ -18,7 +18,7 @@ Copy-Item "$build\dist\AutomacoesDominio.exe" "$dir\dist" -Force
 # tarefa so mata o pai, entao encerra pelo caminho (so a copia desta pasta).
 $exe = Join-Path $dir 'AutomacoesDominio.exe'
 Stop-ScheduledTask -TaskName 'Ouvinte Dominio' -ErrorAction SilentlyContinue
-Get-Process AutomacoesDominio -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
+Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
 Copy-Item "$build\dist\AutomacoesDominio.exe" $dir -Force
 Start-ScheduledTask -TaskName 'Ouvinte Dominio' -ErrorAction SilentlyContinue
