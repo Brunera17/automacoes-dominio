@@ -1,0 +1,14 @@
+# Configuração real (servidor e nomes da equipe): cada máquina tem a sua. Modelo em config.exemplo.json
+config.json
+
+# Gerados em uso: dados de clientes, logs e estado
+logs/
+estado/
+resumos/
+contagens/
+
+# Build
+dist/
+*.exe
+__pycache__/
+*.spec

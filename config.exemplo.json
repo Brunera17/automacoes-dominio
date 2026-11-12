@@ -1,0 +1,12 @@
+{
+  "pasta_entrada": "",
+  "raiz_empresas": "\\\\SERVIDOR\\COMPARTILHAMENTO\\DP FISCAL\\SIMPLES NACIONAL",
+  "raiz_relatorios": "\\\\SERVIDOR\\COMPARTILHAMENTO\\DP FISCAL\\SIMPLES NACIONAL\\.RELATÓRIOS",
+  "usuarios": ["MARIA", "JOAO"],
+  "intervalo_seg": 20,
+  "estabilidade_seg": 15,
+  "reprocessar_pendentes_min": 60,
+  "tentativas_antes_de_erro": 5,
+  "retencao_processados_dias": 90,
+  "simulacao": true
+}
